@@ -1,0 +1,243 @@
+from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form, status, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from fastapi.security import OAuth2PasswordBearer
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+from typing import List, Optional
+from datetime import datetime, timedelta, timezone
+from passlib.context import CryptContext
+from jose import JWTError, jwt
+import json, os, uuid, base64, random
+
+# ── Config ─────────────────────────────────────────────────────────────────────
+SECRET_KEY = os.getenv("SECRET_KEY", "change-me-in-production-super-secret-key")
+ALGORITHM  = "HS256"
+TOKEN_TTL  = int(os.getenv("TOKEN_TTL_MINUTES", 60))
+
+DB_FILE    = "package.json"
+USERS_FILE = "users.json"
+UPLOAD_DIR = "uploads"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+# ── App ────────────────────────────────────────────────────────────────────────
+app = FastAPI(title="Student Registry API", version="2.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["*"],
+)
+
+app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
+
+# ── Auth helpers ───────────────────────────────────────────────────────────────
+pwd_ctx       = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
+
+def make_token(username: str) -> str:
+    payload = {
+        "sub": username,
+        "exp": datetime.now(timezone.utc) + timedelta(minutes=TOKEN_TTL),
+    }
+    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+
+async def current_user(token: str = Depends(oauth2_scheme)) -> str:
+    try:
+        payload  = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username = payload.get("sub")
+    except JWTError:
+        username = None
+    if not username or username not in load_users():
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return username
+
+# ── JSON I/O ───────────────────────────────────────────────────────────────────
+def _read_json(path: str):
+    with open(path) as f:
+        return json.load(f)
+
+def _write_json(path: str, data):
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+
+# ── User store ─────────────────────────────────────────────────────────────────
+def load_users() -> dict:
+    if not os.path.exists(USERS_FILE):
+        users = {"admin": pwd_ctx.hash("admin123")}
+        _write_json(USERS_FILE, users)
+        return users
+    return _read_json(USERS_FILE)
+
+def save_users(users: dict):
+    _write_json(USERS_FILE, users)
+
+# ── Student store ──────────────────────────────────────────────────────────────
+def load_students() -> List[dict]:
+    return _read_json(DB_FILE) if os.path.exists(DB_FILE) else []
+
+def save_students(students: List[dict]):
+    _write_json(DB_FILE, students)
+
+def find_student(students: List[dict], student_id: int) -> dict:
+    student = next((s for s in students if s["id"] == student_id), None)
+    if not student:
+        raise HTTPException(status_code=404, detail="Student not found.")
+    return student
+
+def next_id(students: List[dict]) -> int:
+    return max((s["id"] for s in students), default=0) + 1
+
+# ── File to base64 helper ──────────────────────────────────────────────────────
+MIME_MAP = {
+    ".png":  "image/png",
+    ".jpg":  "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif":  "image/gif",
+    ".webp": "image/webp",
+    ".pdf":  "application/pdf",
+    ".doc":  "application/msword",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+}
+
+async def file_to_base64(file: UploadFile) -> str:
+    contents = await file.read()
+    ext      = os.path.splitext(file.filename)[1].lower()
+    mime     = MIME_MAP.get(ext, "application/octet-stream")
+    b64      = base64.b64encode(contents).decode("utf-8")
+    return f"data:{mime};base64,{b64}"
+
+# ── Schemas ────────────────────────────────────────────────────────────────────
+class Token(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+
+class RegisterUser(BaseModel):
+    username: str
+    password: str
+
+class StudentOut(BaseModel):
+    id: int
+    name: str
+    student_class: str
+    roll_no: Optional[str] = None
+    file_url: Optional[str] = None
+    registered_at: Optional[str] = None
+
+# ── Auth routes ────────────────────────────────────────────────────────────────
+@app.post("/auth/register", status_code=201)
+def register_user(body: RegisterUser):
+    users = load_users()
+    if body.username in users:
+        raise HTTPException(status_code=409, detail="Username already exists.")
+    users[body.username] = pwd_ctx.hash(body.password)
+    save_users(users)
+    return {"message": f"User '{body.username}' registered successfully."}
+
+@app.post("/auth/login", response_model=Token)
+async def login(request: Request):
+    try:
+        body = await request.json()
+    except:
+        raise HTTPException(status_code=422, detail="Invalid JSON body")
+    username = body.get("username")
+    password = body.get("password")
+    if not username or not password:
+        raise HTTPException(status_code=422, detail="Username and password required")
+    users  = load_users()
+    hashed = users.get(username)
+    if not hashed or not pwd_ctx.verify(password, hashed):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return Token(access_token=make_token(username))
+
+@app.get("/auth/me")
+def me(user: str = Depends(current_user)):
+    return {"username": user}
+
+# ── Chatbot route ──────────────────────────────────────────────────────────────
+@app.post("/chat")
+async def chat(body: ChatMessage, user: str = Depends(current_user)):
+    if not body.message.strip():
+        raise HTTPException(status_code=400, detail="Message cannot be empty.")
+    students = load_students()
+    reply    = chatbot_reply(body.message, students)
+    return {"reply": reply}
+
+# ── Student routes ─────────────────────────────────────────────────────────────
+@app.post("/register", response_model=StudentOut, status_code=201)
+async def register_student(
+    name: str = Form(...),
+    student_class: str = Form(...),
+    roll_no: str = Form(...),
+    file: Optional[UploadFile] = File(None),
+    user: str = Depends(current_user),
+):
+    name, student_class, roll_no = name.strip(), student_class.strip(), roll_no.strip()
+
+    file_url = None
+    if file and file.filename:
+        file_url = await file_to_base64(file)
+
+    students = load_students()
+    student  = {
+        "id":            next_id(students),
+        "name":          name,
+        "student_class": student_class,
+        "roll_no":       roll_no,
+        "file_url":      file_url,
+        "registered_at": datetime.now(timezone.utc).isoformat(),
+    }
+    students.append(student)
+    save_students(students)
+    return student
+
+@app.get("/students", response_model=List[StudentOut])
+def list_students(user: str = Depends(current_user)):
+    return load_students()
+
+@app.get("/students/{student_id}", response_model=StudentOut)
+def get_student(student_id: int, user: str = Depends(current_user)):
+    return find_student(load_students(), student_id)
+
+@app.put("/students/{student_id}", response_model=StudentOut)
+async def update_student(
+    student_id: int,
+    name: Optional[str] = Form(None),
+    student_class: Optional[str] = Form(None),
+    roll_no: Optional[str] = Form(None),
+    file: Optional[UploadFile] = File(None),
+    user: str = Depends(current_user),
+):
+    students = load_students()
+    student  = find_student(students, student_id)
+
+    if name:          student["name"]          = name.strip()
+    if student_class: student["student_class"] = student_class.strip()
+    if roll_no:       student["roll_no"]        = roll_no.strip()
+
+    if file and file.filename:
+        student["file_url"] = await file_to_base64(file)
+
+    save_students(students)
+    return student
+
+@app.delete("/students/{student_id}")
+def delete_student(student_id: int, user: str = Depends(current_user)):
+    students = load_students()
+    find_student(students, student_id)
+    save_students([s for s in students if s["id"] != student_id])
+    return {"message": f"Student {student_id} deleted."}
+
+@app.get("/")
+def root():
+    return {"status": "Student Registry API v2 is running 🎓"}
